@@ -61,6 +61,7 @@ async def stream_audio(artist: str = Query(...), name: str = Query(...)):
                         yield chunk
 
         mime = "audio/mpeg" if info["ext"] == "mp3" else "audio/ogg" if info["ext"] == "ogg" else "audio/mpeg"
+        print(f"Sending format: ext={info['ext']}, url={info['url'][:50]}")
         return StreamingResponse(
             generate(),
             media_type=mime,
