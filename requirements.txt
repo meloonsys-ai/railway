@@ -2,4 +2,3 @@ fastapi
 uvicorn[standard]
 yt-dlp
 httpx
-gunicorn
