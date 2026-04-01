@@ -15,7 +15,7 @@ app.add_middleware(
 
 def get_audio_info(query: str):
     ydl_opts = {
-        "format": "bestaudio[ext=mp3]/bestaudio[acodec=mp3]/bestaudio/best",
+        "format": "bestaudio[protocol!*=m3u8][protocol!*=hls][ext!=m3u8]/bestaudio[protocol=https]/bestaudio",
         "quiet": True,
         "noplaylist": True,
     }
@@ -25,12 +25,26 @@ def get_audio_info(query: str):
             return None
         entry = info["entries"][0]
         formats = entry.get("formats", [])
-        audio_formats = [f for f in formats if f.get("acodec") != "none" and f.get("url")]
-        if not audio_formats:
+
+        # Фильтруем — только прямые ссылки без HLS
+        good_formats = [
+            f for f in formats
+            if f.get("acodec") != "none"
+            and f.get("url")
+            and "m3u8" not in f.get("url", "")
+            and "m3u8" not in (f.get("ext") or "")
+            and "hls" not in (f.get("protocol") or "")
+            and f.get("protocol") in ("https", "http", None)
+        ]
+
+        print(f"Total formats: {len(formats)}, Good formats: {len(good_formats)}")
+        for f in good_formats:
+            print(f"  ext={f.get('ext')} abr={f.get('abr')} protocol={f.get('protocol')} url={f.get('url','')[:60]}")
+
+        if not good_formats:
             return None
-        # Предпочитаем mp3
-        mp3 = [f for f in audio_formats if f.get("ext") == "mp3"]
-        best = sorted(mp3 or audio_formats, key=lambda f: f.get("abr") or 0, reverse=True)[0]
+
+        best = sorted(good_formats, key=lambda f: f.get("abr") or 0, reverse=True)[0]
         return {
             "url": best["url"],
             "ext": best.get("ext", "mp3"),
@@ -54,14 +68,15 @@ async def stream_audio(artist: str = Query(...), name: str = Query(...)):
         return JSONResponse({"error": "Не найдено"}, status_code=404)
 
     try:
+        print(f"Streaming: ext={info['ext']}, url={info['url'][:80]}")
+
         async def generate():
             async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
                 async with client.stream("GET", info["url"]) as r:
                     async for chunk in r.aiter_bytes(8192):
                         yield chunk
 
-        mime = "audio/mpeg" if info["ext"] == "mp3" else "audio/ogg" if info["ext"] == "ogg" else "audio/mpeg"
-        print(f"Sending format: ext={info['ext']}, url={info['url'][:50]}")
+        mime = "audio/mpeg" if info["ext"] in ("mp3", "m4a") else "audio/ogg" if info["ext"] == "ogg" else "audio/mpeg"
         return StreamingResponse(
             generate(),
             media_type=mime,
