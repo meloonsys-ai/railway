@@ -2,8 +2,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
-import subprocess
-import os
+import httpx
 
 app = FastAPI()
 
@@ -14,9 +13,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_audio_url(query: str):
+def get_audio_info(query: str):
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=mp3]/bestaudio[acodec=mp3]/bestaudio/best",
         "quiet": True,
         "noplaylist": True,
     }
@@ -29,57 +28,44 @@ def get_audio_url(query: str):
         audio_formats = [f for f in formats if f.get("acodec") != "none" and f.get("url")]
         if not audio_formats:
             return None
-        best = sorted(audio_formats, key=lambda f: f.get("abr") or 0, reverse=True)[0]
-        return {"url": best["url"], "title": entry.get("title", query)}
+        # Предпочитаем mp3
+        mp3 = [f for f in audio_formats if f.get("ext") == "mp3"]
+        best = sorted(mp3 or audio_formats, key=lambda f: f.get("abr") or 0, reverse=True)[0]
+        return {
+            "url": best["url"],
+            "ext": best.get("ext", "mp3"),
+            "title": entry.get("title", query),
+        }
 
 
 @app.get("/stream")
 async def stream_audio(artist: str = Query(...), name: str = Query(...)):
     queries = [f"{artist} {name}", f"{artist} - {name}", f"{name} {artist}"]
-
     info = None
     for q in queries:
         try:
-            info = get_audio_url(q)
+            info = get_audio_info(q)
             if info:
                 break
         except Exception as e:
-            print(f"Query failed '{q}': {e}")
+            print(f"Failed '{q}': {e}")
 
     if not info:
-        return JSONResponse({"error": "Трек не найден"}, status_code=404)
+        return JSONResponse({"error": "Не найдено"}, status_code=404)
 
     try:
-        # Конвертируем в mp3 через ffmpeg прямо в стрим
-        cmd = [
-            "ffmpeg", "-i", info["url"],
-            "-vn",                    # без видео
-            "-acodec", "libmp3lame", # mp3
-            "-ab", "192k",           # битрейт
-            "-ar", "44100",          # частота
-            "-f", "mp3",             # формат
-            "-loglevel", "quiet",
-            "pipe:1"                 # вывод в stdout
-        ]
+        async def generate():
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                async with client.stream("GET", info["url"]) as r:
+                    async for chunk in r.aiter_bytes(8192):
+                        yield chunk
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        def generate():
-            try:
-                while True:
-                    chunk = process.stdout.read(8192)
-                    if not chunk:
-                        break
-                    yield chunk
-            finally:
-                process.kill()
-
+        mime = "audio/mpeg" if info["ext"] == "mp3" else "audio/ogg" if info["ext"] == "ogg" else "audio/mpeg"
         return StreamingResponse(
             generate(),
-            media_type="audio/mpeg",
-            headers={"Cache-Control": "no-cache", "Accept-Ranges": "none"}
+            media_type=mime,
+            headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"}
         )
-
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
