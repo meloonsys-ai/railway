@@ -21,6 +21,7 @@ def get_audio_url(query: str) -> dict:
         "quiet": True,
         "noplaylist": True,
         "extract_flat": False,
+        "cookiefile": "cookies.txt",
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(f"ytsearch1:{query}", download=False)
