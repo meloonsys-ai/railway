@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 yt-dlp
 httpx
+boto3
+supabase
