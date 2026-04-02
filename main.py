@@ -147,7 +147,7 @@ async def download_track(
             "album": album,
             "cover_url": cover,
             "duration": duration,
-        }).execute()
+        }, on_conflict="user_id,track_id").execute()
     except Exception as e:
         print(f"Supabase error: {e}")
 
