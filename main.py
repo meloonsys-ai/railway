@@ -777,7 +777,7 @@ def get_audio_info(query: str):
 
 
 @app.get("/stream")
-async def stream_audio(artist: str = Query(...), name: str = Query(...)):
+async def stream_audio(artist: str = Query(...), name: str = Query(...), request: Request = None):
     queries = [f"{artist} {name}", f"{artist} - {name}", f"{name} {artist}"]
     info = None
     for q in queries:
@@ -791,14 +791,52 @@ async def stream_audio(artist: str = Query(...), name: str = Query(...)):
         return JSONResponse({"error": "Не найдено"}, status_code=404)
 
     try:
+        # Получаем размер файла через HEAD
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            head = await client.head(info["url"])
+            total_size = int(head.headers.get("content-length", 0))
+
+        # Обрабатываем Range request для seek
+        range_header = request.headers.get("range") if request else None
+        start = 0
+        end = total_size - 1 if total_size else None
+
+        if range_header and total_size:
+            # Range: bytes=12345-
+            try:
+                range_match = range_header.replace("bytes=", "").split("-")
+                start = int(range_match[0]) if range_match[0] else 0
+                end = int(range_match[1]) if len(range_match) > 1 and range_match[1] else total_size - 1
+            except:
+                start = 0
+                end = total_size - 1
+
         async def generate():
+            headers = {}
+            if total_size and (start > 0 or end < total_size - 1):
+                headers["Range"] = f"bytes={start}-{end}"
             async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-                async with client.stream("GET", info["url"]) as r:
+                async with client.stream("GET", info["url"], headers=headers) as r:
                     async for chunk in r.aiter_bytes(8192):
                         yield chunk
 
-        return StreamingResponse(generate(), media_type="audio/mpeg",
-                                 headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"})
+        response_headers = {
+            "Cache-Control": "public, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",
+        }
+
+        if total_size:
+            if range_header:
+                # Частичный ответ 206 для seek
+                response_headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+                response_headers["Content-Length"] = str(end - start + 1)
+                return StreamingResponse(generate(), media_type="audio/mpeg",
+                                         headers=response_headers, status_code=206)
+            else:
+                response_headers["Content-Length"] = str(total_size)
+
+        return StreamingResponse(generate(), media_type="audio/mpeg", headers=response_headers)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
