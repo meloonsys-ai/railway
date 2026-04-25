@@ -756,90 +756,205 @@ async def close_session(session_id: str, request: Request):
 # ══════════════════════════════════════════
 
 
-def get_audio_info(query: str):
-    ydl_opts = {
-        "format": "bestaudio[protocol!*=m3u8][protocol!*=hls]/bestaudio",
-        "quiet": True,
-        "noplaylist": True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"scsearch1:{query}", download=False)
-        if not info or not info.get("entries"):
-            return None
-        entry = info["entries"][0]
-        formats = entry.get("formats", [])
-        good = [f for f in formats if f.get("acodec") != "none" and f.get("url")
-                and "m3u8" not in f.get("url", "") and f.get("protocol") in ("https", "http", None)]
-        if not good:
-            return None
-        best = sorted(good, key=lambda f: f.get("abr") or 0, reverse=True)[0]
-        return {"url": best["url"], "ext": best.get("ext", "mp3")}
+# ── ГЛОБАЛЬНЫЙ HTTP КЛИЕНТ ──
+http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=5, read=60, write=30, pool=5),
+    follow_redirects=True,
+    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+)
+
+# ── ПОИСК НА SOUNDCLOUD (scsearch5 + матчинг по длительности) ──
+def get_audio_info(artist: str, name: str, duration_ms: int = 0):
+    GARBAGE_WORDS = {"remix", "bass boosted", "cover", "karaoke", "nightcore",
+                     "slowed", "reverb", "sped up", "speed up", "instrumental"}
+
+    def name_is_clean(entry_title: str) -> bool:
+        t = entry_title.lower()
+        orig_has_remix = "remix" in name.lower()
+        for word in GARBAGE_WORDS:
+            if word in t and (word != "remix" or not orig_has_remix):
+                return False
+        return True
+
+    def dur_diff(entry_dur: int) -> int:
+        if not duration_ms or not entry_dur:
+            return 999
+        return abs(entry_dur - duration_ms // 1000)
+
+    query = f"{artist} {name}"
+    ydl_opts = {"format": "bestaudio[protocol!*=m3u8][protocol!*=hls]/bestaudio",
+                "quiet": True, "noplaylist": True}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"scsearch5:{query}", download=False)
+            if not info or not info.get("entries"):
+                return None
+
+            candidates = []
+            for entry in (info["entries"] or []):
+                if not entry: continue
+                formats = [f for f in entry.get("formats", []) if
+                           f.get("acodec") != "none" and f.get("url") and
+                           "m3u8" not in f.get("url", "") and
+                           f.get("protocol") in ("https", "http", None)]
+                if not formats: continue
+                best_fmt = sorted(formats, key=lambda f: f.get("abr") or 0, reverse=True)[0]
+                candidates.append({
+                    "url": best_fmt["url"], "ext": best_fmt.get("ext", "mp3"),
+                    "duration": entry.get("duration", 0),
+                    "title": entry.get("title", ""),
+                    "clean": name_is_clean(entry.get("title", "")),
+                    "diff": dur_diff(entry.get("duration", 0)),
+                })
+
+            if not candidates: return None
+            # Сначала чистые по длительности, потом всё остальное
+            clean = [c for c in candidates if c["clean"]]
+            pool = sorted(clean or candidates, key=lambda c: c["diff"])
+            best = pool[0]
+            print(f"[yt-dlp] '{best['title']}' diff={best['diff']}s clean={best['clean']}")
+            return {"url": best["url"], "ext": best["ext"], "dur_diff": best["diff"], "sc_duration": best["duration"]}
+    except Exception as e:
+        print(f"[yt-dlp] Error: {e}")
+        return None
+
+
+async def get_cached_stream_url(track_id: str) -> str | None:
+    try:
+        res = supabase.table("track_cache").select(
+            "sc_url, expires_at, r2_path"
+        ).eq("spotify_id", track_id).execute()
+        if not res.data: return None
+        row = res.data[0]
+        if row.get("r2_path"):
+            return f"{R2_PUBLIC_URL}/{row['r2_path']}"
+        if not row.get("sc_url"): return None
+        expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+        if expires > datetime.now(timezone.utc) + timedelta(minutes=5):
+            return row["sc_url"]
+        return None
+    except: return None
+
+
+async def save_stream_url(track_id: str, url: str, artist: str = "",
+                          name: str = "", duration_ms: int = 0,
+                          sc_duration: int = 0, dur_diff: int = 0):
+    try:
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        supabase.table("track_cache").upsert({
+            "spotify_id": track_id,
+            "artist": artist[:200] if artist else "",
+            "name": name[:200] if name else "",
+            "sc_url": url,
+            "sc_duration": sc_duration,
+            "duration_ms": duration_ms,
+            "dur_diff_sec": min(dur_diff, 32767),
+            "is_verified": dur_diff < 5,
+            "expires_at": expires_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="spotify_id").execute()
+    except Exception as e:
+        print(f"[cache] {e}")
+
+
+async def mark_r2_in_cache(track_id: str, r2_path: str):
+    try:
+        supabase.table("track_cache").upsert({
+            "spotify_id": track_id,
+            "r2_path": r2_path,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=365)).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="spotify_id").execute()
+    except Exception as e:
+        print(f"[cache r2] {e}")
 
 
 @app.get("/stream")
-async def stream_audio(artist: str = Query(...), name: str = Query(...), request: Request = None):
-    queries = [f"{artist} {name}", f"{artist} - {name}", f"{name} {artist}"]
-    info = None
-    for q in queries:
+async def stream_audio(
+    artist: str = Query(...),
+    name: str = Query(...),
+    track_id: str = Query(default=""),
+    duration_ms: int = Query(default=0),
+    request: Request = None,
+):
+    # 1. R2 (скачан ранее)
+    if track_id:
         try:
-            info = get_audio_info(q)
-            if info: break
-        except Exception as e:
-            print(f"Failed '{q}': {e}")
+            r2.head_object(Bucket=R2_BUCKET, Key=f"{track_id}.mp3")
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=f"{R2_PUBLIC_URL}/{track_id}.mp3", status_code=302)
+        except: pass
 
-    if not info:
-        return JSONResponse({"error": "Не найдено"}, status_code=404)
+    # 2. Link Cache
+    stream_url = None
+    if track_id:
+        stream_url = await get_cached_stream_url(track_id)
+        if stream_url: print(f"[cache] HIT {track_id}")
 
-    try:
-        # Получаем размер файла через HEAD
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            head = await client.head(info["url"])
-            total_size = int(head.headers.get("content-length", 0))
+    # 3. yt-dlp поиск
+    if not stream_url:
+        info = get_audio_info(artist, name, duration_ms)
+        if not info:
+            return JSONResponse({"error": "Не найдено"}, status_code=404)
+        stream_url = info["url"]
+        if track_id:
+            import asyncio
+            asyncio.create_task(save_stream_url(
+                    track_id, stream_url,
+                    artist=artist, name=name,
+                    duration_ms=duration_ms,
+                    sc_duration=info.get("sc_duration", 0),
+                    dur_diff=info.get("dur_diff", 0)
+                ))
 
-        # Обрабатываем Range request для seek
-        range_header = request.headers.get("range") if request else None
-        start = 0
-        end = total_size - 1 if total_size else None
+    # 4. Стрим 32KB чанками
+    range_header = request.headers.get("range") if request else None
 
-        if range_header and total_size:
-            # Range: bytes=12345-
-            try:
-                range_match = range_header.replace("bytes=", "").split("-")
-                start = int(range_match[0]) if range_match[0] else 0
-                end = int(range_match[1]) if len(range_match) > 1 and range_match[1] else total_size - 1
-            except:
-                start = 0
-                end = total_size - 1
+    async def generate():
+        req_headers = {"Range": range_header} if range_header else {}
+        async with http_client.stream("GET", stream_url, headers=req_headers) as r:
+            async for chunk in r.aiter_bytes(32768):
+                yield chunk
 
-        async def generate():
-            headers = {}
-            if total_size and (start > 0 or end < total_size - 1):
-                headers["Range"] = f"bytes={start}-{end}"
-            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-                async with client.stream("GET", info["url"], headers=headers) as r:
-                    async for chunk in r.aiter_bytes(8192):
-                        yield chunk
+    response_headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+    }
+    status_code = 200
+    if range_header:
+        try:
+            async with http_client.stream("GET", stream_url, headers={"Range": range_header}) as probe:
+                if probe.status_code == 206:
+                    response_headers["Content-Range"] = probe.headers.get("content-range", "")
+                    cl = probe.headers.get("content-length", "")
+                    if cl: response_headers["Content-Length"] = cl
+                    status_code = 206
+        except: pass
 
-        response_headers = {
-            "Cache-Control": "public, max-age=3600",
-            "Access-Control-Allow-Origin": "*",
-            "Accept-Ranges": "bytes",
-        }
+    return StreamingResponse(generate(), media_type="audio/mpeg",
+                             headers=response_headers, status_code=status_code)
 
-        if total_size:
-            if range_header:
-                # Частичный ответ 206 для seek
-                response_headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
-                response_headers["Content-Length"] = str(end - start + 1)
-                return StreamingResponse(generate(), media_type="audio/mpeg",
-                                         headers=response_headers, status_code=206)
-            else:
-                response_headers["Content-Length"] = str(total_size)
 
-        return StreamingResponse(generate(), media_type="audio/mpeg", headers=response_headers)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+@app.post("/prefetch")
+async def prefetch_tracks(request: Request):
+    body = await request.json()
+    tracks = body.get("tracks", [])[:3]
+    import asyncio
 
+    async def cache_one(t):
+        tid = t.get("id", "")
+        if not tid: return
+        try:
+            r2.head_object(Bucket=R2_BUCKET, Key=f"{tid}.mp3")
+            return
+        except: pass
+        if await get_cached_stream_url(tid): return
+        info = get_audio_info(t.get("artist",""), t.get("name",""), t.get("duration_ms",0))
+        if info: await save_stream_url(tid, info["url"])
+
+    await asyncio.gather(*[cache_one(t) for t in tracks])
+    return JSONResponse({"ok": True})
 
 @app.post("/download")
 async def download_track(
@@ -850,6 +965,7 @@ async def download_track(
     cover: str = Query(default=""),
     album: str = Query(default=""),
     duration: str = Query(default=""),
+    duration_ms: int = Query(default=0),
 ):
     r2_key = f"{track_id}.mp3"
     file_url = f"{R2_PUBLIC_URL}/{r2_key}"
@@ -857,26 +973,19 @@ async def download_track(
     try:
         r2.head_object(Bucket=R2_BUCKET, Key=r2_key)
     except Exception:
-        queries = [f"{artist} {name}", f"{artist} - {name}"]
-        info = None
-        for q in queries:
-            try:
-                info = get_audio_info(q)
-                if info: break
-            except: pass
-
-        if not info:
-            return JSONResponse({"error": "Трек не найден"}, status_code=404)
+        stream_url = await get_cached_stream_url(track_id)
+        if not stream_url:
+            info = get_audio_info(artist, name, duration_ms)
+            if not info:
+                return JSONResponse({"error": "Трек не найден"}, status_code=404)
+            stream_url = info["url"]
 
         try:
-            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-                res = await client.get(info["url"])
-                audio_data = res.content
-
-            r2.put_object(
-                Bucket=R2_BUCKET, Key=r2_key,
-                Body=audio_data, ContentType="audio/mpeg",
-            )
+            res = await http_client.get(stream_url)
+            r2.put_object(Bucket=R2_BUCKET, Key=r2_key,
+                          Body=res.content, ContentType="audio/mpeg")
+            import asyncio
+            asyncio.create_task(mark_r2_in_cache(track_id, r2_key))
         except Exception as e:
             return JSONResponse({"error": f"Ошибка загрузки: {e}"}, status_code=500)
 
@@ -890,7 +999,6 @@ async def download_track(
         print(f"Supabase error: {e}")
 
     return JSONResponse({"success": True, "file_url": file_url})
-
 
 @app.get("/downloads")
 async def get_downloads(user_id: int = Query(...)):
@@ -906,6 +1014,186 @@ async def delete_download(user_id: int = Query(...), track_id: str = Query(...))
     try:
         supabase.table("downloads").delete().eq("user_id", user_id).eq("track_id", track_id).execute()
         return JSONResponse({"success": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ══════════════════════════════════════════════════════
+# ── ОНБОРДИНГ: Динамическое расширение (снежный ком) ──
+# ══════════════════════════════════════════════════════
+
+# In-memory кеш related artists (24 часа)
+_related_cache: dict = {}  # artist_id -> {artists: [...], expires: timestamp}
+
+async def get_spotify_related(artist_id: str) -> list:
+    """Получаем похожих артистов из Spotify с кешем на 24 часа"""
+    import time
+
+    # Проверяем in-memory кеш
+    cached = _related_cache.get(artist_id)
+    if cached and cached["expires"] > time.time():
+        return cached["artists"]
+
+    # Проверяем artist_cache в Supabase
+    try:
+        res = supabase.table("artist_cache").select(
+            "related_ids, related_at, name"
+        ).eq("spotify_id", artist_id).execute()
+        if res.data and res.data[0].get("related_ids"):
+            row = res.data[0]
+            related_at = row.get("related_at")
+            if related_at:
+                ra = datetime.fromisoformat(related_at.replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - ra).total_seconds() < 86400:
+                    # Возвращаем из Supabase кеша
+                    ids = row["related_ids"]
+                    result = [{"id": i} for i in ids]
+                    _related_cache[artist_id] = {"artists": result, "expires": time.time() + 86400}
+                    return result
+    except: pass
+
+    # Запрашиваем Spotify
+    try:
+        token_r = await http_client.post(
+            "https://accounts.spotify.com/api/token",
+            headers={
+                "Authorization": "Basic " + __import__("base64").b64encode(
+                    f"{os.environ.get('SPOTIFY_CLIENT_ID')}:{os.environ.get('SPOTIFY_CLIENT_SECRET')}".encode()
+                ).decode()
+            },
+            data={"grant_type": "client_credentials"}
+        )
+        token = token_r.json().get("access_token")
+        if not token:
+            return []
+
+        rel_r = await http_client.get(
+            f"https://api.spotify.com/v1/artists/{artist_id}/related-artists",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        data = rel_r.json()
+        artists = data.get("artists", [])[:10]
+
+        result = [
+            {
+                "id": a["id"],
+                "name": a["name"],
+                "cover": a["images"][0]["url"] if a.get("images") else None,
+                "genres": a.get("genres", [])[:2],
+                "popularity": a.get("popularity", 0),
+            }
+            for a in artists
+        ]
+
+        # Сохраняем в in-memory
+        _related_cache[artist_id] = {"artists": result, "expires": time.time() + 86400}
+
+        # Сохраняем related_ids в artist_cache
+        try:
+            supabase.table("artist_cache").upsert({
+                "spotify_id": artist_id,
+                "related_ids": [a["id"] for a in result],
+                "related_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="spotify_id").execute()
+        except: pass
+
+        return result
+    except Exception as e:
+        print(f"[onboarding/expand] {e}")
+        return []
+
+
+@app.get("/api/onboarding/expand")
+async def onboarding_expand(artist_id: str = Query(...)):
+    """Снежный ком: возвращает похожих артистов для выбранного"""
+    if not artist_id:
+        return JSONResponse({"error": "artist_id required"}, status_code=400)
+
+    related = await get_spotify_related(artist_id)
+    return JSONResponse({"artists": related})
+
+
+@app.get("/api/onboarding/seeds")
+async def onboarding_seeds():
+    """Начальный набор артистов для онбординга — разные жанры"""
+    # Статичный список — 20 топовых артистов разных жанров
+    SEED_ARTISTS = [
+        {"id": "3TVXtAsR1Inumwj472S9r4", "name": "Drake", "genre": "hip-hop"},
+        {"id": "1Xyo4u8uXC1ZmMpatF05PJ", "name": "The Weeknd", "genre": "r&b"},
+        {"id": "2YZyLoL8N0Wb9xBt1NhZWg", "name": "Kendrick Lamar", "genre": "rap"},
+        {"id": "06HL4z0CvFAxyc27GXpf02", "name": "Taylor Swift", "genre": "pop"},
+        {"id": "246dkjvS1zLTtiykXe5h60", "name": "Post Malone", "genre": "hip-hop"},
+        {"id": "6qqNVTkY8uBg9cP3Jd7DAH", "name": "Billie Eilish", "genre": "alt-pop"},
+        {"id": "0Y5tJX1MQlPlqiwlOH1tJY", "name": "Travis Scott", "genre": "trap"},
+        {"id": "4q3ewBCX7sLwd24euuV69X", "name": "Bad Bunny", "genre": "reggaeton"},
+        {"id": "5LHRHt1k9lMyONurDHEdrp", "name": "Eminem", "genre": "rap"},
+        {"id": "4oLeXFyACqeem2VImYeBFe", "name": "Kanye West", "genre": "rap"},
+        {"id": "7dGJo4pcD2V6oG8kP0tJRR", "name": "Eminem", "genre": "rap"},
+        # Русские артисты
+        {"id": "2A7Ch1dIhGMz3EWyxbNWBo", "name": "Скриптонит", "genre": "рэп"},
+        {"id": "3JRMkSBcnAXlmGMBnYsV3c", "name": "Miyagi & Эндшпиль", "genre": "рэп"},
+        {"id": "4lGnEkKKONfFpJfcJDWV3w", "name": "Oxxxymiron", "genre": "рэп"},
+        {"id": "0HiLKNOkpGYkH6Mwe9YZEM", "name": "PHARAOH", "genre": "рэп"},
+        {"id": "1SqNqMmwGJXr9EkAHjifqD", "name": "MORGENSHTERN", "genre": "рэп"},
+        # Другие жанры
+        {"id": "53XhwfbYqKCa1cC15pYq2q", "name": "Imagine Dragons", "genre": "rock"},
+        {"id": "1vCWHaC5f2uS3yhpwWbIA6", "name": "Avicii", "genre": "electronic"},
+        {"id": "7n2Ycct7Beij7Dj7meI4X0", "name": "Rammstein", "genre": "metal"},
+        {"id": "0C8ZW7ezQVs4URX5aX7Kqx", "name": "Coldplay", "genre": "indie"},
+    ]
+
+    # Обогащаем данными из Spotify если есть в кеше
+    result = []
+    for a in SEED_ARTISTS:
+        try:
+            cached = supabase.table("artist_cache").select(
+                "name, cover_url, genres"
+            ).eq("spotify_id", a["id"]).execute()
+            if cached.data and cached.data[0].get("cover_url"):
+                row = cached.data[0]
+                result.append({
+                    "id": a["id"],
+                    "name": row["name"] or a["name"],
+                    "cover": row["cover_url"],
+                    "genres": row.get("genres") or [],
+                })
+                continue
+        except: pass
+        result.append({"id": a["id"], "name": a["name"], "cover": None, "genres": []})
+
+    return JSONResponse({"artists": result})
+
+
+@app.post("/api/onboarding/complete")
+async def onboarding_complete(request: Request):
+    """Сохраняем выбранные артисты и запускаем пре-фетч волны"""
+    init_data = request.headers.get("x-telegram-init-data", "")
+    user = validate_init_data(init_data)
+    if not user:
+        return JSONResponse({"error": "Invalid auth"}, status_code=401)
+
+    body = await request.json()
+    artist_ids = body.get("artist_ids", [])
+    if len(artist_ids) < 3:
+        return JSONResponse({"error": "Нужно минимум 3 артиста"}, status_code=400)
+
+    user_id = str(user["id"])
+
+    try:
+        # Сохраняем профиль
+        supabase.table("user_profiles").upsert({
+            "user_id": user_id,
+            "favorite_artist_ids": artist_ids,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="user_id").execute()
+
+        # Также сохраняем в social_users
+        supabase.table("social_users").upsert({
+            "id": user_id,
+            "last_seen": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="id").execute()
+
+        return JSONResponse({"ok": True, "saved": len(artist_ids)})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
