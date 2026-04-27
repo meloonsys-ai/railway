@@ -17,6 +17,15 @@ from datetime import datetime, timedelta, timezone
 
 app = FastAPI()
 
+# Thread pool побольше для параллельных yt-dlp поисков
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+@app.on_event("startup")
+async def setup_thread_pool():
+    loop = asyncio.get_event_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=10))
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -891,14 +900,15 @@ async def stream_audio(
         stream_url = await get_cached_stream_url(track_id)
         if stream_url: print(f"[cache] HIT {track_id}")
 
-    # 3. yt-dlp поиск
+    # 3. yt-dlp поиск (в отдельном thread pool чтобы не блокировать event loop)
     if not stream_url:
-        info = get_audio_info(artist, name, duration_ms)
+        import asyncio
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, get_audio_info, artist, name, duration_ms)
         if not info:
             return JSONResponse({"error": "Не найдено"}, status_code=404)
         stream_url = info["url"]
         if track_id:
-            import asyncio
             asyncio.create_task(save_stream_url(
                     track_id, stream_url,
                     artist=artist, name=name,
@@ -939,7 +949,7 @@ async def stream_audio(
 @app.post("/prefetch")
 async def prefetch_tracks(request: Request):
     body = await request.json()
-    tracks = body.get("tracks", [])[:3]
+    tracks = body.get("tracks", [])[:5]  # До 5 треков
     import asyncio
 
     async def cache_one(t):
@@ -950,11 +960,25 @@ async def prefetch_tracks(request: Request):
             return
         except: pass
         if await get_cached_stream_url(tid): return
-        info = get_audio_info(t.get("artist",""), t.get("name",""), t.get("duration_ms",0))
-        if info: await save_stream_url(tid, info["url"])
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(
+            None, get_audio_info,
+            t.get("artist",""), t.get("name",""), t.get("duration_ms",0)
+        )
+        if info:
+            await save_stream_url(
+                tid, info["url"],
+                artist=t.get("artist",""), name=t.get("name",""),
+                duration_ms=t.get("duration_ms",0),
+                sc_duration=info.get("sc_duration", 0),
+                dur_diff=info.get("dur_diff", 0)
+            )
 
-    await asyncio.gather(*[cache_one(t) for t in tracks])
-    return JSONResponse({"ok": True})
+    # Fire-and-forget — клиент не ждёт завершения
+    for t in tracks:
+        asyncio.create_task(cache_one(t))
+
+    return JSONResponse({"ok": True, "queued": len(tracks)})
 
 @app.post("/download")
 async def download_track(
