@@ -1164,6 +1164,24 @@ async def onboarding_seeds():
     return JSONResponse({"artists": result})
 
 
+@app.get("/api/onboarding/check")
+async def onboarding_check(request: Request):
+    """Проверяем прошёл ли пользователь онбординг (для восстановления при удалении localStorage)"""
+    init_data = request.headers.get("x-telegram-init-data", "")
+    user = validate_init_data(init_data)
+    if not user:
+        return JSONResponse({"completed": False, "artist_ids": []})
+
+    user_id = str(user["id"])
+    try:
+        res = supabase.table("user_profiles").select("favorite_artist_ids").eq("user_id", user_id).execute()
+        if res.data and res.data[0].get("favorite_artist_ids"):
+            ids = res.data[0]["favorite_artist_ids"]
+            return JSONResponse({"completed": len(ids) >= 3, "artist_ids": ids})
+    except: pass
+    return JSONResponse({"completed": False, "artist_ids": []})
+
+
 @app.post("/api/onboarding/complete")
 async def onboarding_complete(request: Request):
     """Сохраняем выбранные артисты и запускаем пре-фетч волны"""
