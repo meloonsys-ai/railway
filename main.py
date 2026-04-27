@@ -1182,6 +1182,22 @@ async def onboarding_check(request: Request):
     return JSONResponse({"completed": False, "artist_ids": []})
 
 
+@app.post("/api/onboarding/reset")
+async def onboarding_reset(request: Request):
+    """Удаляем профиль пользователя — онбординг покажется заново"""
+    init_data = request.headers.get("x-telegram-init-data", "")
+    user = validate_init_data(init_data)
+    if not user:
+        return JSONResponse({"error": "Invalid auth"}, status_code=401)
+
+    user_id = str(user["id"])
+    try:
+        supabase.table("user_profiles").delete().eq("user_id", user_id).execute()
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.post("/api/onboarding/complete")
 async def onboarding_complete(request: Request):
     """Сохраняем выбранные артисты и запускаем пре-фетч волны"""
